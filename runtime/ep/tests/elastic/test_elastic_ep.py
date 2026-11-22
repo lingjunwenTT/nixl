@@ -13,7 +13,8 @@ ranks call `set_active_ranks`; already-idle buffers retain their descriptor. Con
 any collective (every rank regenerates every other rank's routing from a seed), then replay the CUDA graph captured at
 the first phase they took part in, both with its original routing (departed owners are dropped) and with fresh routing
 over the current active experts. Payloads, received expert indices/weights and expert statistics are checked.
-Single-rank traffic phases are supported.
+Single-rank traffic phases are supported. `--dtype` selects BF16, FP8 or synthetic NVFP4 dispatch bytes for
+checked and timed pairs; combine stays BF16. Each run uses matching buffer capacity.
 Ranks that are not active mirror every collective and touch no kernel. Timing is opt-in: `--benchmark` measures CUDA-event
 call/pair times, `--kineto` measures kernels, `--perf-phases` selects phases for both, and `--feed-pairs` measures transitions.
 `--skip-perf-test` suppresses event benchmarks; `--save-output [PATH]` saves per-rank results and configuration as JSON.
@@ -33,7 +34,7 @@ import os
 import time
 from datetime import timedelta
 from statistics import median_high as median
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, TypedDict
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, TypedDict, Union
 
 import torch
 import torch.distributed as dist
@@ -101,6 +102,7 @@ def make_buffer(
         num_topk=placement.pop("num_topk", args.num_topk),
         num_experts_per_rank=args.num_experts // max_ranks,
         num_launch_sms=args.num_sms,
+        use_fp8_dispatch=getattr(args, "dtype", "bf16") != "bf16",
         allow_multiple_reduction=bool(args.allow_multiple_reduction),
         prefer_overlap_with_compute=bool(args.prefer_overlap_with_compute),
         explicitly_destroy=True,
@@ -202,6 +204,49 @@ def sample_routing(
     return idx.to(nixl_ep_v2.topk_idx_t), weights.float().contiguous()
 
 
+# A dispatch payload: BF16 rows, or `(data, scales)` for FP8 and NVFP4
+Payload = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+
+
+def as_nvfp4(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Synthetic NVFP4 transport bytes: packed values and e4m3 block scales."""
+    hidden = x.shape[1]
+    raw = x.contiguous().view(torch.uint8)
+    codes = raw[:, : hidden // 2].contiguous()
+    scales = raw[:, hidden // 2 : hidden // 2 + hidden // 16].contiguous()
+    return codes, scales.view(torch.float8_e4m3fn)
+
+
+def payload_parts(x: Payload) -> Tuple[torch.Tensor, ...]:
+    return x if isinstance(x, tuple) else (x,)
+
+
+# Rows move as bytes: float8 tensors lack indexing and concatenation kernels on some devices
+def payload_rows(x: Payload, index) -> Payload:
+    """The rows `index` of every component of a payload"""
+    rows = tuple(t.view(torch.uint8)[index].view(t.dtype) for t in payload_parts(x))
+    return rows if isinstance(x, tuple) else rows[0]
+
+
+def cat_payloads(parts: Sequence[Payload]) -> Payload:
+    components = zip(*(payload_parts(p) for p in parts))
+    joined = tuple(
+        torch.cat([t.view(torch.uint8) for t in c]).view(c[0].dtype) for c in components
+    )
+    return joined if isinstance(parts[0], tuple) else joined[0]
+
+
+def payload_equal(a: Payload, b: Payload) -> bool:
+    """Same components, dtypes, shapes and bytes (compared as uint8: arbitrary e4m3 scale bytes can be NaN)"""
+    a_parts, b_parts = payload_parts(a), payload_parts(b)
+    return len(a_parts) == len(b_parts) and all(
+        x.dtype == y.dtype
+        and x.shape == y.shape
+        and torch.equal(x.view(torch.uint8), y.view(torch.uint8))
+        for x, y in zip(a_parts, b_parts)
+    )
+
+
 def combine_recipe(buffer: nixl_ep_v2.ElasticBuffer):
     # Without `allow_multiple_reduction` the combine input is already reduced within the rank, as in `test_ep.py`
     return (
@@ -218,6 +263,7 @@ class Case:
     def __init__(self, buffer: nixl_ep_v2.ElasticBuffer, args: argparse.Namespace):
         self.buffer = buffer
         self.args = args
+        self.dtype = getattr(args, "dtype", "bf16")
         self.max_so, self.max_su = (
             buffer.max_num_scaleout_ranks,
             buffer.max_num_scaleup_ranks,
@@ -280,8 +326,13 @@ class Case:
             self.num_tokens_of(world_rank), device="cuda"
         )
 
-    def payload(self, global_idx: torch.Tensor) -> torch.Tensor:
-        return self.pre_combine_data(global_idx.clamp_min(0), 1)[:, 0, :]
+    def payload(self, global_idx: torch.Tensor) -> Payload:
+        x = self.pre_combine_data(global_idx.clamp_min(0), 1)[:, 0, :]
+        if self.dtype == "fp8":
+            return per_token_cast_to_fp8(x)
+        if self.dtype == "nvfp4":
+            return as_nvfp4(x)
+        return x
 
     def pre_combine_data(
         self, global_idx: torch.Tensor, num_topk: Optional[int] = None
@@ -335,7 +386,7 @@ class Case:
 
     def expected_receive(
         self, phase_idx: int, phase: List[int]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Payload, torch.Tensor, torch.Tensor]:
         """What this rank receives in the phase, sorted by source global index: `(global_idx, x, local_topk_idx, weights)`"""
         me = self.buffer.world_rank
         epr = self.buffer.num_experts_per_rank
@@ -353,7 +404,7 @@ class Case:
             chunks.append(
                 (
                     gidx,
-                    self.payload(self.payload_indices(src)[mine]),
+                    payload_rows(self.payload(self.payload_indices(src)), mine),
                     local_idx,
                     topk_weights[mine],
                 )
@@ -362,7 +413,7 @@ class Case:
         order = torch.argsort(gidx)
         return (
             gidx[order],
-            torch.cat([c[1] for c in chunks])[order],
+            payload_rows(cat_payloads([c[1] for c in chunks]), order),
             torch.cat([c[2] for c in chunks])[order],
             torch.cat([c[3] for c in chunks])[order],
         )
@@ -411,9 +462,9 @@ def check_dispatch(
     assert torch.equal(
         gidx[order], exp_gidx
     ), f"[{tag}] received source tokens differ from the expectation"
-    assert torch.equal(
-        recv_x[:num_recv][order], exp_x
-    ), f"[{tag}] received payload mismatch"
+    assert payload_equal(
+        payload_rows(payload_rows(recv_x, slice(num_recv)), order), exp_x
+    ), f"[{tag}] received payload mismatch ({case.dtype})"
     assert torch.equal(
         recv_topk_idx[:num_recv][order].to(torch.int64), exp_idx.to(torch.int64)
     ), f"[{tag}] local expert indices mismatch"
@@ -650,8 +701,10 @@ class PairCase:
         x = torch.randn(
             n, case.hidden, dtype=torch.bfloat16, device="cuda", generator=g
         )
-        if args.perf_fp8:
+        if case.dtype == "fp8":
             x = per_token_cast_to_fp8(x)
+        elif case.dtype == "nvfp4":
+            x = as_nvfp4(x)
         self.dispatch_args = dict(
             x=x,
             topk_idx=topk_idx,
@@ -755,7 +808,7 @@ class GraphCase:
         self.handle: Optional[nixl_ep_v2.EPHandle] = None
         self.graph: Optional[torch.cuda.CUDAGraph] = None
         self.outputs: Optional[torch.Tensor] = None
-        self.recv_x: Optional[torch.Tensor] = None
+        self.recv_x: Optional[Payload] = None
         self.recv_topk_idx: Optional[torch.Tensor] = None
         self.recv_topk_weights: Optional[torch.Tensor] = None
 
@@ -859,7 +912,9 @@ class GraphCase:
             src_idx, src_w = self._replay_routing(src, phase, routing_phase_idx)
             mine = case.reaches_me(src_idx, phase)
             expected_src_parts.append(case.global_idx(src, phase)[mine])
-            expected_x_parts.append(case.payload(case.payload_indices(src)[mine]))
+            expected_x_parts.append(
+                payload_rows(case.payload(case.payload_indices(src)), mine)
+            )
             expected_idx_parts.append(
                 torch.where(src_idx[mine] // epr == me, src_idx[mine] - me * epr, -1)
             )
@@ -867,7 +922,7 @@ class GraphCase:
             local_idx = src_idx[src_idx // epr == me].to(torch.int64) - me * epr
             expected_stats += torch.bincount(local_idx, minlength=epr)
         expected_src = torch.cat(expected_src_parts)
-        expected_x = torch.cat(expected_x_parts)
+        expected_x = cat_payloads(expected_x_parts)
         expected = expected_src.numel()
         num_recv = self.handle.num_recv_tokens_device.item()
         assert num_recv == expected, (
@@ -880,9 +935,10 @@ class GraphCase:
         assert torch.equal(
             received_src[order], expected_src[expected_order]
         ), f"[{tag}] graph received source tokens mismatch"
-        assert torch.equal(
-            self.recv_x[:num_recv][order], expected_x[expected_order]
-        ), f"[{tag}] graph received payload mismatch"
+        assert payload_equal(
+            payload_rows(payload_rows(self.recv_x, slice(num_recv)), order),
+            payload_rows(expected_x, expected_order),
+        ), f"[{tag}] graph received payload mismatch ({case.dtype})"
         assert self.recv_topk_idx is not None and self.recv_topk_weights is not None
         assert torch.equal(
             self.recv_topk_idx[:num_recv][order].to(torch.int64),
@@ -1394,11 +1450,10 @@ def make_parser() -> argparse.ArgumentParser:
         help="tokens per active rank in the timed phases (default: --num-tokens)",
     )
     parser.add_argument(
-        "--perf-fp8",
-        type=int,
-        default=0,
-        choices=(0, 1),
-        help="FP8 dispatch payload in the timed phases (default BF16)",
+        "--dtype",
+        default="bf16",
+        choices=("bf16", "fp8", "nvfp4"),
+        help="dispatch format for checked and timed pairs; combine stays BF16",
     )
     parser.add_argument(
         "--perf-tag", type=str, default="run", help="label of the PERF and TRANS lines"
