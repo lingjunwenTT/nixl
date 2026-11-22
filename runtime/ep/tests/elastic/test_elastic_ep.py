@@ -23,8 +23,8 @@ run and keeps it alive until every peer has torn down (if a previous run still h
 `--store-timeout-secs` bounds every Store wait, `--num-cpu-timeout-secs` only the dispatch's CPU sync. `--num-experts`
 is the total physical slot count of the declared maximum world and must be divisible by its rank count. `--max-scaleup-ranks 72
 --position-offset 64` assigns public IDs 64..71 to a 1 x 8 job; internal positions are discovered, not prescribed.
-    python tests/elastic/test_adaptive_elastic.py --num-processes 4 --num-tokens 512 --hidden 7168 --num-topk 8 --num-experts 192
-    python tests/elastic/test_adaptive_elastic.py --plan '[[0,1,2,3,4,5,6,7],[0,1,2,3],[0,1,2,3,4,5,6,7]]' ...
+    python tests/elastic/test_elastic_ep.py --num-processes 4 --num-tokens 512 --hidden 7168 --num-topk 8 --num-experts 192
+    python tests/elastic/test_elastic_ep.py --plan '[[0,1,2,3,4,5,6,7],[0,1,2,3],[0,1,2,3,4,5,6,7]]' ...
 """
 import argparse
 import json
@@ -37,7 +37,6 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple, TypedDict
 import torch
 import torch.distributed as dist
 from buffer_setup import rank_coordinates, rank_mapping, topology_experts
-from test_adaptive_modes import NUM_CAPTURE_BARRIERS, capture, combine_recipe
 
 import nixl.runtime.ep as nixl_ep_v2
 from nixl.runtime.ep.utils.math import calc_diff, per_token_cast_to_fp8
@@ -200,6 +199,14 @@ def sample_routing(
         idx = torch.nn.functional.pad(idx, (0, padding), value=-1)
         weights = torch.nn.functional.pad(weights, (0, padding))
     return idx.to(nixl_ep_v2.topk_idx_t), weights.float().contiguous()
+
+
+def combine_recipe(buffer: nixl_ep_v2.ElasticBuffer):
+    # Without `allow_multiple_reduction` the combine input is already reduced within the rank, as in `test_ep.py`
+    return (
+        True,
+        buffer.allow_multiple_reduction and buffer._get_mode() == "hybrid",
+    )
 
 
 class Case:
@@ -685,6 +692,29 @@ def run_feed(
     return starts[0], ends, [s.elapsed_time(e) * 1e3 for s, e in zip(starts, ends)]
 
 
+# The barriers `capture` runs (before the warm-ups, before the capture, after it), for idle ranks that mirror them
+NUM_CAPTURE_BARRIERS = 3
+
+
+def capture(forward, barrier=dist.barrier, do_capture=True):
+    # Warm up eagerly (JIT compile, first-touch allocations), then capture one graph.
+    # `do_capture=False` runs the same warm-ups and barriers without capturing
+    torch.cuda.synchronize()
+    barrier()
+    for _ in range(2):
+        forward()
+    torch.cuda.synchronize()
+    barrier()
+    graph, outputs = None, None
+    if do_capture:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outputs = forward()
+    torch.cuda.synchronize()
+    barrier()
+    return graph, outputs
+
+
 class GraphCase:
     """One graph of dispatch (no CPU sync) + combine, with routing sampled over `full_phase`,
     and replayed in every later phase against the reference of that phase (dropped selections included).
@@ -759,7 +789,7 @@ class GraphCase:
     NUM_CAPTURE_BARRIERS = NUM_CAPTURE_BARRIERS
 
     def capture(self, accompany: bool = False):
-        # The capture protocol of `test_adaptive_modes` over this rank's barrier; the other active ranks run it in
+        # The capture protocol over this rank's barrier; the other active ranks run it in
         # lockstep (`accompany`: warm-ups and barriers only, for a rank that has its graph), idle ranks mirror the barriers
         graph, outputs = capture(self.forward, self.barrier, do_capture=not accompany)
         if not accompany:
