@@ -11,8 +11,9 @@ ranks call `set_active_ranks`; already-idle buffers retain their descriptor. Con
 (with `--reconnect-on-leave` a leave is a symmetric `disconnect_ranks`, a rejoin a symmetric
 `connect_ranks`). Active ranks run one eager dispatch (CPU sync) + combine routed over the ACTIVE experts, checked without
 any collective (every rank regenerates every other rank's routing from a seed), then replay the CUDA graph captured at
-the first phase they took part in against the reference of the current phase (payloads and expert statistics checked;
-selections of experts owned by ranks that left are dropped). Single-rank traffic phases are supported.
+the first phase they took part in, both with its original routing (departed owners are dropped) and with fresh routing
+over the current active experts. Payloads, received expert indices/weights and expert statistics are checked.
+Single-rank traffic phases are supported.
 Ranks that are not active mirror every collective and touch no kernel. Timing is opt-in: `--benchmark` measures CUDA-event
 call/pair times, `--kineto` measures kernels, `--perf-phases` selects phases for both, and `--feed-pairs` measures transitions.
 `--skip-perf-test` suppresses event benchmarks; `--save-output [PATH]` saves per-rank results and configuration as JSON.
@@ -722,6 +723,7 @@ class GraphCase:
 
     # The phase index the graph's routing is sampled at (`Case.routing` seeds by it): one no plan reaches, apart from every eager phase
     CAPTURE_ROUTING_PHASE = 10_000
+    REROUTE_ROUTING_PHASE = 20_000
     STATS_GUARD = 104729
 
     def __init__(
@@ -732,7 +734,7 @@ class GraphCase:
         barrier_fn: Callable[[], None],
     ):
         self.case = case
-        # The phase whose routing and payload each rank captured; warmup may use a smaller active world.
+        # The phase whose routing each rank captured; warmup may use a smaller active world.
         self.capture_phase_of = capture_phase_of
         # The caller's barrier over the active ranks (the process test's spans several cohorts)
         self.barrier = barrier_fn
@@ -754,9 +756,11 @@ class GraphCase:
         self.graph: Optional[torch.cuda.CUDAGraph] = None
         self.outputs: Optional[torch.Tensor] = None
         self.recv_x: Optional[torch.Tensor] = None
+        self.recv_topk_idx: Optional[torch.Tensor] = None
+        self.recv_topk_weights: Optional[torch.Tensor] = None
 
     def forward(self):
-        """One dispatch + combine; returns the combined output, handle and received payload, which only `capture` keeps"""
+        """One dispatch + combine; outputs are retained only from capture."""
         case = self.case
         dispatch_args = dict(
             x=self.x,
@@ -783,7 +787,7 @@ class GraphCase:
         # Without a CPU sync the count is only on the GPU: the combine input covers the worst-case-sized output
         y = case.combine_input(handle.recv_src_metadata[:, 0], recv_topk_idx)
         combined_x, _ = case.buffer.combine(x=y, handle=handle)
-        return combined_x, handle, recv_x
+        return combined_x, handle, recv_x, recv_topk_idx, recv_topk_weights
 
     # The barriers the shared `capture` runs (before the warm-ups, before the capture, after it), for idle ranks that mirror them
     NUM_CAPTURE_BARRIERS = NUM_CAPTURE_BARRIERS
@@ -794,18 +798,45 @@ class GraphCase:
         graph, outputs = capture(self.forward, self.barrier, do_capture=not accompany)
         if not accompany:
             self.graph = graph
-            combined_x, self.handle, self.recv_x = outputs
-            self.outputs = combined_x
+            (
+                self.outputs,
+                self.handle,
+                self.recv_x,
+                self.recv_topk_idx,
+                self.recv_topk_weights,
+            ) = outputs
 
-    def replay_and_check(self, phase: List[int], tag: str):
-        assert self.graph is not None
+    def _replay_routing(self, src, phase, routing_phase_idx):
+        if routing_phase_idx is None:
+            routing_phase_idx = self.CAPTURE_ROUTING_PHASE
+            phase = self.capture_phase_of[src]
+        return self.case.routing(routing_phase_idx, src, phase)
+
+    def replay_and_check(
+        self, phase: List[int], tag: str, routing_phase_idx: Optional[int] = None
+    ):
+        """Restore captured routing, or reroute every active rank with the same phase index."""
+        assert self.graph is not None and self.outputs is not None
+        topk_idx, weights = self._replay_routing(
+            self.case.buffer.world_rank, phase, routing_phase_idx
+        )
+        self.topk_idx.copy_(topk_idx)
+        self.topk_weights.copy_(weights)
+        # A previous combine result can equal the reference; require this replay to write it.
+        self.outputs.fill_(float("nan"))
         self.stats.zero_()
         self.graph.replay()
         torch.cuda.synchronize()
-        return self.check(phase, tag)
+        return self.check(phase, tag, routing_phase_idx=routing_phase_idx)
 
-    def check(self, phase: List[int], tag: str, num_replays: int = 1):
-        """Check completed outputs; num_replays counts executions since the expert statistics were reset."""
+    def check(
+        self,
+        phase: List[int],
+        tag: str,
+        num_replays: int = 1,
+        routing_phase_idx: Optional[int] = None,
+    ):
+        """Check outputs for the replay's routing; num_replays counts executions since statistics reset."""
         case = self.case
         me = case.buffer.world_rank
         assert self.handle is not None and self.recv_x is not None
@@ -819,17 +850,20 @@ class GraphCase:
         assert torch.equal(
             combined_x, ref
         ), f"[{tag}] graph combined_x mismatch, diff={calc_diff(combined_x, ref)}"
-        # Every active source replays its captured routing and payload; source metadata follows THIS
-        # phase's source extent; expert ownership stays at its world rank. Zero receives is legitimate.
+        # Source metadata follows the current extent; payloads and expert owners use stable world IDs.
         expected_src_parts, expected_x_parts = [], []
+        expected_idx_parts, expected_w_parts = [], []
         epr = case.buffer.num_experts_per_rank
         expected_stats = torch.zeros(epr, dtype=torch.int64, device="cuda")
         for src in phase:
-            capture_phase = self.capture_phase_of[src]
-            src_idx, _ = case.routing(self.CAPTURE_ROUTING_PHASE, src, capture_phase)
+            src_idx, src_w = self._replay_routing(src, phase, routing_phase_idx)
             mine = case.reaches_me(src_idx, phase)
             expected_src_parts.append(case.global_idx(src, phase)[mine])
             expected_x_parts.append(case.payload(case.payload_indices(src)[mine]))
+            expected_idx_parts.append(
+                torch.where(src_idx[mine] // epr == me, src_idx[mine] - me * epr, -1)
+            )
+            expected_w_parts.append(src_w[mine])
             local_idx = src_idx[src_idx // epr == me].to(torch.int64) - me * epr
             expected_stats += torch.bincount(local_idx, minlength=epr)
         expected_src = torch.cat(expected_src_parts)
@@ -849,6 +883,15 @@ class GraphCase:
         assert torch.equal(
             self.recv_x[:num_recv][order], expected_x[expected_order]
         ), f"[{tag}] graph received payload mismatch"
+        assert self.recv_topk_idx is not None and self.recv_topk_weights is not None
+        assert torch.equal(
+            self.recv_topk_idx[:num_recv][order].to(torch.int64),
+            torch.cat(expected_idx_parts)[expected_order].to(torch.int64),
+        ), f"[{tag}] graph local expert indices mismatch"
+        assert torch.equal(
+            self.recv_topk_weights[:num_recv][order],
+            torch.cat(expected_w_parts)[expected_order],
+        ), f"[{tag}] graph weights mismatch"
         assert torch.equal(
             self.stats[:epr].to(torch.int64), expected_stats * num_replays
         ), f"[{tag}] graph expert statistics mismatch"
@@ -864,6 +907,7 @@ class GraphCase:
         return num_recv
 
     def release(self):
+        self.recv_topk_idx = self.recv_topk_weights = None
         del self.outputs, self.recv_x, self.graph, self.stats, self.stats_storage
         self.outputs = self.recv_x = self.graph = self.stats = self.stats_storage = None
         torch.cuda.synchronize()
@@ -1180,11 +1224,19 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             num_recv_graph = graph.replay_and_check(phase, tag)
             if profile:
                 print_profile(buffer, phase_idx, "graph")
+            num_recv_rerouted = graph.replay_and_check(
+                phase,
+                tag,
+                routing_phase_idx=GraphCase.REROUTE_ROUTING_PHASE + phase_idx,
+            )
+            if profile:
+                print_profile(buffer, phase_idx, "graph-rerouted")
             # One line per phase from the lowest active rank (local rank 0 may sit the phase out)
             if me == min(phase):
                 print(
                     f" > [{tag}] eager: {num_recv} tokens received, bitwise match; "
-                    f"graph replay (captured at phase {graph.capture_phase_of[me]}): {num_recv_graph} tokens received, bitwise match",
+                    f"graph replay (captured at phase {graph.capture_phase_of[me]}): {num_recv_graph} tokens received; "
+                    f"rerouted: {num_recv_rerouted} tokens received, bitwise match",
                     flush=True,
                 )
             measure_events, measure_kernels = benchmark_options(
@@ -1212,6 +1264,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                         extent=[so_extent, su_extent],
                         eager_num_recv=num_recv,
                         graph_num_recv=num_recv_graph,
+                        graph_rerouted_num_recv=num_recv_rerouted,
                         performance=performance,
                     )
                 )
