@@ -6,16 +6,16 @@
 Elastic membership of the adaptive EP kernels on the NIXL transport (RDMA + NVLink; the host derives the kernel mode of
 each phase, direct iff one NVLink domain is active): a plan of phases
 (phases: lists of public world ranks whose discovered slots form a product of
-NVLink domains and positions) on a job whose processes all stay alive. Per phase, joining, leaving and continuing
-ranks call `set_active_ranks`; already-idle buffers retain their descriptor. Connections are kept
-(with `--reconnect-on-leave` a leave is a symmetric `disconnect_ranks`, a rejoin a symmetric
-`connect_ranks`). Active ranks run one eager dispatch (CPU sync) + combine routed over the ACTIVE experts, checked without
+NVLink domains and positions) on a job whose processes all stay alive. Participating ranks activate each phase.
+By default, departing ranks also adopt that phase to become inactive while keeping their connections.
+With `--reconnect-on-leave`, departing ranks retire their peers into a local singleton state and sit out;
+rejoining ranks reconnect before activation. Participating ranks run one eager dispatch (CPU sync) + combine routed over the ACTIVE experts, checked without
 any collective (every rank regenerates every other rank's routing from a seed), then replay the CUDA graph captured at
 the first phase they took part in, both with its original routing (departed owners are dropped) and with fresh routing
 over the current active experts. Payloads, received expert indices/weights and expert statistics are checked.
 Single-rank traffic phases are supported. `--dtype` selects BF16, FP8 or synthetic NVFP4 dispatch bytes for
 checked and timed pairs; combine stays BF16. Each run uses matching buffer capacity.
-Ranks that are not active mirror every collective and touch no kernel. Timing is opt-in: `--benchmark` measures CUDA-event
+Ranks outside the phase mirror host barriers but do not dispatch or combine. Timing is opt-in: `--benchmark` measures CUDA-event
 call/pair times, `--kineto` measures kernels, `--perf-phases` selects phases for both, and `--feed-pairs` measures transitions.
 `--skip-perf-test` suppresses event benchmarks; `--save-output [PATH]` saves per-rank results and configuration as JSON.
 
@@ -996,7 +996,6 @@ def expected_mode(
     """
     The mode the host must have derived for the active ranks `phase` (world ranks), stated independently of the library:
     direct iff exactly one NVLink domain is active, hybrid otherwise.
-    Shared by the elastic and processes tests.
     """
     mapping = mapping or {r: r for r in phase}
     one_domain = len({mapping[r] // max_num_scaleup_ranks for r in phase}) == 1
@@ -1024,13 +1023,11 @@ def switch_world(
     timings: Optional[TransitionTimings] = None,
 ) -> None:
     """
-    Collective: apply `phase` to leaving, joining and continuing ranks; already-idle buffers retain their descriptor.
-    `barrier_fn` spans all processes.
-    The host derives the kernel mode of the new world; it is checked against the rule (`expected_mode`) once committed.
-    By default only the masks (`scaleout_mask`, `scaleup_mask`) of the topology descriptor (`EPTopology`) change and
-    every connection is kept; with `reconnect_on_leave` a leave is a symmetric `disconnect_ranks` and a rejoin a symmetric
-    `connect_ranks` (one retained UCX endpoint pair per cycle). `timings`: host ms per step, peer counts, two CUDA events
-    around topology activation. `store_timeout_secs` bounds the Store wait of `connect_ranks`.
+    Drain the old world, activate participants and optionally retire peers; `barrier_fn` spans all processes.
+    With reconnection, departing buffers return to a singleton and participation follows `phase`.
+    Otherwise departing ranks adopt `phase` to become inactive while retaining connections.
+    `timings`: host ms per step, peer counts and two CUDA events around activation.
+    `store_timeout_secs` bounds the Store wait of `connect_ranks`.
     """
     t: TransitionTimings = timings if timings is not None else {}
     t0 = time.perf_counter()
@@ -1039,7 +1036,9 @@ def switch_world(
     t_drained = time.perf_counter()
     me = buffer.world_rank
     active = me in phase
-    update_membership = active or me in buffer.get_active_ranks()
+    update_membership = active or (
+        not reconnect_on_leave and me in buffer.get_active_ranks()
+    )
     connected = set(buffer.get_connected_ranks())
     if reconnect_on_leave:
         needed = (set(phase) - {me}) if active else set()
@@ -1068,7 +1067,8 @@ def switch_world(
     torch.cuda.synchronize()
     barrier_fn()
     t5 = time.perf_counter()
-    assert (buffer.world_rank in buffer.get_active_ranks()) == active
+    if not reconnect_on_leave:
+        assert (me in buffer.get_active_ranks()) == active
     if update_membership:
         assert buffer.get_active_ranks() == sorted(phase)
         expected = expected_mode(
@@ -1078,7 +1078,7 @@ def switch_world(
             buffer._get_mode() == expected
         ), f"the host derived {buffer._get_mode()} for {phase}, expected {expected}"
 
-    # Real leave: the masks of the topology descriptor (`EPTopology`) exclude the peers, so drop them symmetrically
+    # Participants retire excluded peers; departing buffers retire all peers and remain singletons.
     leaving = sorted(connected - needed) if reconnect_on_leave else []
     t["num_disconnect"] = len(leaving)
     t6 = time.perf_counter()
@@ -1088,6 +1088,9 @@ def switch_world(
     torch.cuda.synchronize()
     barrier_fn()
     t8 = time.perf_counter()
+    if reconnect_on_leave and not active:
+        assert buffer.get_active_ranks() == [me]
+        assert not buffer.get_connected_ranks()
     t.update(
         {
             "connect": (t2 - t1) * 1e3,
@@ -1197,7 +1200,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             switch_world(
                 buffer, phase, barrier, args.store_timeout_secs, args.reconnect_on_leave
             )
-            if buffer.world_rank in buffer.get_active_ranks():
+            if me in phase:
                 PairCase(case, phase_idx, phase, args).pair()
             barrier()
             warmed.update(phase)
@@ -1216,21 +1219,20 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             args.reconnect_on_leave,
             timings=tim,
         )
-        so_extent, su_extent = case.extent(phase)
-        active_mode = buffer._get_mode()  # what the host derived for this world
-        tag = f"rank {me} {active_mode} phase {phase_idx} {phase} (extent {so_extent}x{su_extent})"
+        active = me in phase
+        active_mode = buffer._get_mode() if active else None
         if feed > 0 and phase_idx > 0:
             # The switch as an engine sees it: the last pair of the old world, the switch, the first pairs of the new
             prev = plan[phase_idx - 1]
             role = (
                 ("stay" if me in prev else "join")
-                if me in phase
+                if active
                 else ("leave" if me in prev else "idle")
             )
             gpu_gap = after = float("nan")
             first_list = ""
             times: List[float] = []
-            if buffer.world_rank in buffer.get_active_ranks():
+            if active:
                 assert pc is not None
                 first_event, _, times = run_feed(pc, feed)
                 first_list = ",".join(f"{v:.0f}" for v in times[:3])
@@ -1242,7 +1244,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             before = median(pre[1]) if pre is not None else float("nan")
             dev_ms = tim["ev_activate_start"].elapsed_time(tim["ev_activate_end"])
             print(
-                f"TRANS tag={args.perf_tag} mode={active_mode} from={phase_idx - 1} to={phase_idx} rank={me} role={role} "
+                f"TRANS tag={args.perf_tag} mode={active_mode or 'inactive'} from={phase_idx - 1} to={phase_idx} rank={me} role={role} "
                 f'live_before={len(prev)} live_after={len(phase)} num_connect={tim["num_connect"]} num_disconnect={tim["num_disconnect"]} '
                 f'connect_ms={tim["connect"]:.2f} activate_ms={tim["activate"]:.3f} '
                 f'disconnect_ms={tim["disconnect"]:.2f} barrier_ms={tim["barrier"]:.2f} switch_ms={tim["total"]:.2f} '
@@ -1266,12 +1268,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                         barrier_ms=tim["barrier"],
                         total_ms=tim["total"],
                         activate_dev_ms=dev_ms,
-                        gpu_gap_ms=(
-                            gpu_gap
-                            if pre is not None
-                            and (buffer.world_rank in buffer.get_active_ranks())
-                            else None
-                        ),
+                        gpu_gap_ms=gpu_gap if pre is not None and active else None,
                         before_us=before if pre is not None else None,
                         first_us=times[:3],
                         after_us=after if times else None,
@@ -1283,7 +1280,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         if me in new_capturers:
             graph = GraphCase(case, phase, capture_phase_of, barrier)
             graph.capture()
-        elif new_capturers and (buffer.world_rank in buffer.get_active_ranks()):
+        elif new_capturers and active:
             assert graph is not None
             graph.capture(accompany=True)
         elif new_capturers:
@@ -1291,7 +1288,9 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                 barrier()
         captured |= set(new_capturers)
 
-        if buffer.world_rank in buffer.get_active_ranks():
+        if active:
+            so_extent, su_extent = case.extent(phase)
+            tag = f"rank {me} {active_mode} phase {phase_idx} {phase} (extent {so_extent}x{su_extent})"
             assert graph is not None
             if profile:
                 buffer.read_profile()  # Discard warm-up or prior-phase samples before this isolated pair.
@@ -1352,11 +1351,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         barrier()
         # The feed's last pairs of this phase, for the next switch (active ranks only)
         pre = None
-        if (
-            feed > 0
-            and (buffer.world_rank in buffer.get_active_ranks())
-            and phase_idx + 1 < len(plan)
-        ):
+        if feed > 0 and active and phase_idx + 1 < len(plan):
             assert pc is not None
             _, ends, times = run_feed(pc, feed)
             pre = (ends, times)
@@ -1493,7 +1488,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reconnect-on-leave",
         action="store_true",
-        help="leave = symmetric disconnect_ranks, rejoin = connect_ranks (default: masks only)",
+        help="retire all peers while a rank sits out; reconnect before it rejoins (default: keep connections)",
     )
     parser.add_argument("--num-cpu-timeout-secs", type=int, default=100)
     parser.add_argument(
