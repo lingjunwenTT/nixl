@@ -248,7 +248,7 @@ def payload_equal(a: Payload, b: Payload) -> bool:
 
 
 def combine_recipe(buffer: nixl_ep_v2.ElasticBuffer):
-    # Without `allow_multiple_reduction` the combine input is already reduced within the rank, as in `test_ep.py`
+    # Without `allow_multiple_reduction` the combine input is already reduced within the rank.
     return (
         True,
         buffer.allow_multiple_reduction and buffer._get_mode() == "hybrid",
