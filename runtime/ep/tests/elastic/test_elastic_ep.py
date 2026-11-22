@@ -255,6 +255,10 @@ def combine_recipe(buffer: nixl_ep_v2.ElasticBuffer):
     )
 
 
+# Bound each large float32 reference intermediate; the final BF16 rows remain allocated.
+COMBINE_SLICE_BYTES = 1 << 30
+
+
 class Case:
     """Deterministic data: rank `r` in phase `p` routes by `seed(p, r)` over the active experts and token `t` carries
     `payload(global idx)`, so every rank can rebuild what it should have received from whom.
@@ -362,9 +366,14 @@ class Case:
         """The combine input from the dispatch output: the pre-combine data of every received row (rows past the real
         count, when present, carry -1 and are never read), zeroed where the selection is not this rank's, reduced within the rank
         """
-        local_y = self.pre_combine_data(src_global_idx.clamp_min(0))
-        local_y[recv_topk_idx == -1] = 0
-        return ordered_accumulate(local_y)
+        y = torch.empty(
+            (src_global_idx.numel(), self.hidden), dtype=torch.bfloat16, device="cuda"
+        )
+        for rows in self.row_slices(y.shape[0]):
+            local_y = self.pre_combine_data(src_global_idx[rows].clamp_min(0))
+            local_y[recv_topk_idx[rows] == -1] = 0
+            y[rows] = ordered_accumulate(local_y)
+        return y
 
     def combine_reference(
         self, phase: List[int], topk_idx: torch.Tensor
@@ -372,17 +381,29 @@ class Case:
         """This rank's expected combine output in the phase for `topk_idx` (dropped selections hold -1 and contribute zero)"""
         active = (topk_idx >= 0) & self.active_expert_mask(phase)[topk_idx.clamp_min(0)]
         topk_idx = torch.where(active, topk_idx, -1)
-        ref_y = self.pre_combine_data(self.global_idx(self.buffer.world_rank, phase))
-        ref_y[~active] = 0
-        return ref_combine(
-            ref_y,
-            topology_experts(self.buffer, topk_idx),
-            self.max_so,
-            self.max_su,
-            self.num_experts,
-            None,
-            *combine_recipe(self.buffer),
+        topk_idx = topology_experts(self.buffer, topk_idx)
+        global_idx = self.global_idx(self.buffer.world_rank, phase)
+        ref = torch.empty(
+            (global_idx.numel(), self.hidden), dtype=torch.bfloat16, device="cuda"
         )
+        for rows in self.row_slices(ref.shape[0]):
+            ref_y = self.pre_combine_data(global_idx[rows])
+            ref_y[~active[rows]] = 0
+            ref[rows] = ref_combine(
+                ref_y,
+                topk_idx[rows],
+                self.max_so,
+                self.max_su,
+                self.num_experts,
+                None,
+                *combine_recipe(self.buffer),
+            )
+        return ref
+
+    def row_slices(self, num_rows: int) -> List[slice]:
+        """Bound temporary memory without changing a token's reduction order."""
+        step = max(1, COMBINE_SLICE_BYTES // (self.num_topk * self.hidden * 4))
+        return [slice(start, start + step) for start in range(0, num_rows, step)]
 
     def expected_receive(
         self, phase_idx: int, phase: List[int]
