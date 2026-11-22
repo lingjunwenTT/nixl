@@ -19,7 +19,7 @@ Ranks that are not active mirror every collective and touch no kernel. Timing is
 call/pair times, `--kineto` measures kernels, `--perf-phases` selects phases for both, and `--feed-pairs` measures transitions.
 `--skip-perf-test` suppresses event benchmarks; `--save-output [PATH]` saves per-rank results and configuration as JSON.
 
-Launch: one invocation per node (`--num-processes` GPUs each) under the node-level `WORLD_SIZE` / `RANK` of `init_dist`,
+Launch: one invocation per node (`--num-processes` GPUs each) under node-level `WORLD_SIZE` / `RANK`,
 no process group; the rank 0 process serves a TCPStore on `MASTER_ADDR` / `MASTER_PORT` (127.0.0.1:8361) for the whole
 run and keeps it alive until every peer has torn down (if a previous run still holds the port, choose another).
 `--store-timeout-secs` bounds every Store wait, `--num-cpu-timeout-secs` only the dispatch's CPU sync. `--num-experts`
@@ -52,7 +52,7 @@ from nixl.runtime.ep.utils.testing import bench, bench_kineto
 def init_test_environment(
     local_rank: int, num_local_ranks: int, seed: int
 ) -> Tuple[int, int]:
-    """`init_dist`'s node-level `WORLD_SIZE`/`RANK` convention without a process group: this process's index in the
+    """Use node-level `WORLD_SIZE`/`RANK` without a process group: this process's index in the
     cohort of every invocation and the cohort size; selects the GPU and seeds per rank.
     """
     num_nodes, node_rank = int(os.getenv("WORLD_SIZE", 1)), int(os.getenv("RANK", 0))
