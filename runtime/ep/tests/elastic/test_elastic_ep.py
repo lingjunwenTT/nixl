@@ -77,7 +77,6 @@ def make_buffer(
     rank_idx: int,
     num_ranks: int,
     store: dist.Store,
-    num_expert_ranks: Optional[int] = None,
     **placement,
 ) -> nixl_ep_v2.ElasticBuffer:
     key_prefix = placement.pop("key_prefix", "NIXL_EP")
@@ -90,7 +89,7 @@ def make_buffer(
             (rank // positions) * max_su + rank % positions for rank in range(num_ranks)
         ]
     assert len(world) == num_ranks and len(set(world)) == num_ranks
-    max_ranks = num_expert_ranks or max_so * max_su
+    max_ranks = max_so * max_su
     assert args.num_experts > 0 and args.num_experts % max_ranks == 0
     buffer = nixl_ep_v2.ElasticBuffer(
         world_rank=world[rank_idx],
@@ -810,7 +809,7 @@ class GraphCase:
         self.case = case
         # The phase whose routing each rank captured; warmup may use a smaller active world.
         self.capture_phase_of = capture_phase_of
-        # The caller's barrier over the active ranks (the process test's spans several cohorts)
+        # Whole-job barrier, including idle ranks.
         self.barrier = barrier_fn
         me = case.buffer.world_rank
         self.topk_idx, self.topk_weights = case.routing(
@@ -1150,8 +1149,6 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         store,
         num_group_scaleup_ranks=cohort.num_scaleup_ranks,
         max_num_scaleup_ranks=args.max_scaleup_ranks,
-        num_expert_ranks=cohort.num_scaleout_ranks
-        * (args.max_scaleup_ranks or cohort.num_scaleup_ranks),
         **placement,
     )
     max_so, max_su = buffer.max_num_scaleout_ranks, buffer.max_num_scaleup_ranks
