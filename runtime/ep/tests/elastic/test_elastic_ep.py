@@ -900,19 +900,25 @@ class GraphCase:
     def replay_and_check(
         self, phase: List[int], tag: str, routing_phase_idx: Optional[int] = None
     ):
-        """Restore captured routing, or reroute every active rank with the same phase index."""
+        """Replay captured or fresh routing twice, checking outputs and cumulative counts."""
         assert self.graph is not None and self.outputs is not None
         topk_idx, weights = self._replay_routing(
             self.case.buffer.world_rank, phase, routing_phase_idx
         )
         self.topk_idx.copy_(topk_idx)
         self.topk_weights.copy_(weights)
-        # A previous combine result can equal the reference; require this replay to write it.
-        self.outputs.fill_(float("nan"))
         self.stats.zero_()
-        self.graph.replay()
-        torch.cuda.synchronize()
-        return self.check(phase, tag, routing_phase_idx=routing_phase_idx)
+        for num_replays in (1, 2):
+            # A previous combine result can equal the reference; require each replay to write it.
+            self.outputs.fill_(float("nan"))
+            self.graph.replay()
+            torch.cuda.synchronize()
+            num_recv = self.check(
+                phase, tag, num_replays=num_replays, routing_phase_idx=routing_phase_idx
+            )
+            if num_replays == 1 and getattr(self.case.args, "profile", False):
+                self.case.buffer.read_profile()  # Keep one replay per profile read.
+        return num_recv
 
     def check(
         self,
