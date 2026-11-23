@@ -29,7 +29,7 @@ Configure Meson from the NIXL repository root with `build_nixl_ep` enabled and
 B200/GB200); communication kernels are JIT-compiled for the running GPU.
 Formatting uses NIXL's Abseil dependency.
 `build_nixl_ep` enables both EP implementations and defaults to false.
-This runtime requires CUDA 13; manylinux wheel builds default EP off on CUDA 12.
+This runtime requires CUDA 13.
 With EP disabled, its build prerequisites are not required. The wheel builder
 enables EP through `--build-nixl-ep`; `--torch-versions` selects the Torch versions
 whose extensions are merged. The container builder enables EP by default on CUDA 13.
