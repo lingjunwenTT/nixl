@@ -26,10 +26,9 @@ no process group; the rank 0 process serves a TCPStore on `MASTER_ADDR` / `MASTE
 run and keeps it alive until every peer has torn down (if a previous run still holds the port, choose another).
 `--store-timeout-secs` bounds every Store wait, `--num-cpu-timeout-secs` only the dispatch's CPU sync. `--num-experts`
 is the total physical slot count of the declared maximum world and must be divisible by its rank count.
-`--num-processes 8 --max-scaleup-ranks 72 --position-offset 64 --num-experts 576` assigns public IDs 64..71
-to a 1 x 8 job; internal positions are discovered, not prescribed.
-    python tests/elastic/test_elastic_ep.py --num-processes 4 --num-tokens 512 --hidden 7168 --num-topk 8 --num-experts 192
-    python tests/elastic/test_elastic_ep.py --plan '[[0,1,2,3,4,5,6,7],[0,1,2,3],[0,1,2,3,4,5,6,7]]' ...
+For a single-domain eight-GPU job, setting `--num-processes` to 8, `--max-scaleup-ranks` to 72,
+`--position-offset` to 64 and `--num-experts` to 576 assigns public IDs 64..71 with eight expert slots per rank;
+internal positions are discovered, not prescribed. `--plan` accepts an inline JSON list of phases or a plan file.
 """
 import argparse
 import json
@@ -1496,7 +1495,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--profile",
         action="store_true",
-        help="print phase boundaries for each eager pair and graph replay; requires NIXL_EP_ADAPTIVE_PROFILE=1",
+        help="print phase boundaries for each eager pair and graph replay; "
+        "requires NIXL_EP_ADAPTIVE_PROFILE set to 1",
     )
     parser.add_argument(
         "--feed-pairs",
