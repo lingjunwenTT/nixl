@@ -455,6 +455,7 @@ def validate_plan(
 ) -> None:
     """Host-only, before any kernel: every phase names distinct world ranks of the maximum world (of the job's `present`
     ranks when given) that form a product set"""
+    assert plan, "The test plan must contain at least one phase"
     max_so, max_su = case.max_so, case.max_su
     for phase in plan:
         assert phase, "A topology phase must be nonempty"
