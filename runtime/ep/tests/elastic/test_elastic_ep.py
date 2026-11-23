@@ -9,7 +9,9 @@ each phase, direct iff one NVLink domain is active): a plan of phases
 NVLink domains and positions) on a job whose processes all stay alive. Participating ranks activate each phase.
 By default, departing ranks also adopt that phase to become inactive while keeping their connections.
 With `--reconnect-on-leave`, departing ranks retire their peers into a local singleton state and sit out;
-rejoining ranks reconnect before activation. Participating ranks run one eager dispatch (CPU sync) + combine routed over the ACTIVE experts, checked without
+rejoining ranks reconnect before activation and may receive new internal positions. Custom plans must remain a product
+of domains and positions after reconnection; unsupported plans fail activation. The default plan restores the full cohort
+between shrinks. Participating ranks run one eager dispatch (CPU sync) + combine routed over the ACTIVE experts, checked without
 any collective (every rank regenerates every other rank's routing from a seed), then replay the CUDA graph captured at
 the first phase they took part in, both with its original routing (departed owners are dropped) and with fresh routing
 over the current active experts. Payloads, received expert indices/weights and expert statistics are checked.
@@ -453,8 +455,10 @@ class Case:
 def validate_plan(
     case: Case, plan: List[List[int]], present: Optional[List[int]] = None
 ) -> None:
-    """Host-only, before any kernel: every phase names distinct world ranks of the maximum world (of the job's `present`
-    ranks when given) that form a product set"""
+    """Check phase IDs and product shapes in the current mapping.
+
+    Reconnection may reassign positions; activation checks the resulting mapping.
+    """
     assert plan, "The test plan must contain at least one phase"
     max_so, max_su = case.max_so, case.max_su
     for phase in plan:
@@ -1503,7 +1507,9 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reconnect-on-leave",
         action="store_true",
-        help="retire all peers while a rank sits out; reconnect before it rejoins (default: keep connections)",
+        help="retire all peers while a rank sits out; reconnect may reassign internal "
+        "positions, so each phase must remain a product of domains and positions "
+        "(default: keep connections)",
     )
     parser.add_argument("--num-cpu-timeout-secs", type=int, default=100)
     parser.add_argument(
