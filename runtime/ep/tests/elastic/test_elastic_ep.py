@@ -643,7 +643,10 @@ def run_perf(
         record["kineto"] = dict(
             zip(
                 ("dispatch_us", "copy_us", "combine_us", "reduce_us"),
-                (float(t) * 1e6 for t in (t_d, copy_d, t_c, red_c)),
+                (
+                    float(t) * 1e6 if t is not None else None
+                    for t in (t_d, copy_d, t_c, red_c)
+                ),
             )
         )
         fields.update(record["kineto"])
@@ -683,7 +686,10 @@ def run_perf(
     print(
         f"PERF tag={args.perf_tag} mode={mode} phase={phase_idx} live={len(phase)} bounds={so_extent}x{su_extent} rank={me} "
         f"tokens={pc.num_tokens} "
-        + " ".join(f"{name}={value:.1f}" for name, value in fields.items()),
+        + " ".join(
+            f"{name}={value:.1f}" if value is not None else f"{name}=N/A"
+            for name, value in fields.items()
+        ),
         flush=True,
     )
     return record
@@ -691,19 +697,23 @@ def run_perf(
 
 def save_results(
     cohort: NixlBootstrap, path: str, config: dict, plan: List[List[int]], records: dict
-) -> None:
+) -> Optional[str]:
     ranks = cohort._all_gather("results", records)
+    error = None
     if cohort.rank == 0:
-        with open(path, "w") as output:
-            json.dump(
-                dict(schema_version=1, config=config, plan=plan, ranks=ranks),
-                output,
-                indent=2,
-                allow_nan=False,
-            )
-            output.write("\n")
-        print(f"Results saved to {path}", flush=True)
-    cohort.barrier("results-written")
+        try:
+            with open(path, "w") as output:
+                json.dump(
+                    dict(schema_version=1, config=config, plan=plan, ranks=ranks),
+                    output,
+                    indent=2,
+                    allow_nan=False,
+                )
+                output.write("\n")
+            print(f"Results saved to {path}", flush=True)
+        except (OSError, TypeError, ValueError) as exc:
+            error = f"Failed to save results to {path}: {type(exc).__name__}: {exc}"
+    return cohort._all_gather("results-written", error)[0]
 
 
 def print_profile(
@@ -992,12 +1002,13 @@ class GraphCase:
         assert torch.equal(
             self.stats[:epr].to(torch.int64), expected_stats * num_replays
         ), f"[{tag}] graph expert statistics mismatch"
-        assert (
-            self.stats.shape
-            == self.handle.psum_num_recv_tokens_per_expert.shape
-            == (epr,)
-        )
-        assert self.handle.num_unaligned_recv_tokens_per_expert.shape == (epr,)
+        assert self.stats.shape == (epr,)
+        assert torch.equal(
+            self.handle.num_unaligned_recv_tokens_per_expert, expected_stats
+        ), f"[{tag}] graph per-expert receive counts mismatch"
+        assert torch.equal(
+            self.handle.psum_num_recv_tokens_per_expert, expected_stats.cumsum(0)
+        ), f"[{tag}] graph per-expert receive prefix sums mismatch"
         assert (
             self.stats_storage[-1].item() == self.STATS_GUARD
         ), f"[{tag}] graph wrote past statistics capacity"
@@ -1210,18 +1221,18 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         args.feed_pairs
     )  # > 0: time every switch under a synthetic feed of dispatch + combine pairs
     if feed > 0:
-        # Warm the fixed kernel specializations on every participating rank before measuring transitions.
+        # Warm each participating rank while retaining connections and their mappings.
         warmed: set[int] = set()
         for phase_idx, phase in enumerate(plan):
             if set(phase) <= warmed:
                 continue
-            switch_world(
-                buffer, phase, barrier, args.store_timeout_secs, args.reconnect_on_leave
-            )
+            switch_world(buffer, phase, barrier, args.store_timeout_secs)
             if me in phase:
                 PairCase(case, phase_idx, phase, args).pair()
             barrier()
             warmed.update(phase)
+        # Restore initial membership without allocating full-world token buffers.
+        switch_world(buffer, present, barrier, args.store_timeout_secs)
     pc = PairCase(case, 0, plan[0], args) if feed > 0 and me in plan[0] else None
     graph: Optional[GraphCase] = None
     captured: set[int] = set()
@@ -1383,8 +1394,9 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         buffer, present, barrier, args.store_timeout_secs, args.reconnect_on_leave
     )
     cohort_print("Adaptive elastic test passed")
+    save_error = None
     if args.save_output:
-        save_results(
+        save_error = save_results(
             cohort,
             args.save_output,
             dict(
@@ -1398,6 +1410,8 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     buffer.destroy()
     # Rank 0 owns the TCPStore server; keep it alive until all peers finish teardown.
     barrier()
+    if save_error is not None and cohort.rank == 0:
+        raise RuntimeError(save_error)
 
 
 def add_common_arguments(parser: argparse.ArgumentParser) -> None:
