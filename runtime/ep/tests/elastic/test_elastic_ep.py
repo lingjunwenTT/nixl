@@ -19,6 +19,7 @@ Single-rank traffic phases are supported. `--dtype` selects BF16, FP8 or synthet
 checked and timed pairs; combine stays BF16. Each run uses matching buffer capacity.
 Ranks outside the phase mirror host barriers but do not dispatch or combine. Timing is opt-in: `--benchmark` measures CUDA-event
 call/pair times, `--kineto` measures kernels, `--perf-phases` selects phases for both, and `--feed-pairs` measures transitions.
+Feed warm-up retains connections while visiting phases with new participants; those phases must also be valid under the initial mapping.
 `--skip-perf-test` suppresses event benchmarks; `--save-output [PATH]` saves per-rank results and configuration as JSON.
 
 Launch: one invocation per node (`--num-processes` GPUs each) under node-level `WORLD_SIZE` / `RANK`,
@@ -33,6 +34,7 @@ internal positions are discovered, not prescribed. `--plan` accepts an inline JS
 import argparse
 import json
 import os
+import tempfile
 import time
 from datetime import timedelta
 from statistics import median_high as median
@@ -454,13 +456,13 @@ class Case:
 def validate_plan(
     case: Case, plan: List[List[int]], present: Optional[List[int]] = None
 ) -> None:
-    """Check phase IDs and product shapes in the current mapping.
+    """Check phase IDs and initial-mapping shapes, except for later reconnect phases.
 
-    Reconnection may reassign positions; activation checks the resulting mapping.
+    Activation checks later reconnect phases against their prepared mappings.
     """
     assert plan, "The test plan must contain at least one phase"
     max_so, max_su = case.max_so, case.max_su
-    for phase in plan:
+    for phase_idx, phase in enumerate(plan):
         assert phase, "A topology phase must be nonempty"
         assert all(0 <= r < max_so * max_su for r in phase) and len(set(phase)) == len(
             phase
@@ -469,7 +471,9 @@ def validate_plan(
             assert set(phase) <= set(
                 present
             ), f"Phase {phase} names ranks that are not in the job {present}"
-        if set(phase) <= rank_mapping(case.buffer).keys():
+        if (phase_idx == 0 or not case.args.reconnect_on_leave) and set(
+            phase
+        ) <= rank_mapping(case.buffer).keys():
             case.buffer._masks_of(phase)  # Future joiners are checked after connection.
 
 
@@ -702,14 +706,19 @@ def save_results(
     error = None
     if cohort.rank == 0:
         try:
-            with open(path, "w") as output:
-                json.dump(
-                    dict(schema_version=1, config=config, plan=plan, ranks=ranks),
-                    output,
-                    indent=2,
-                    allow_nan=False,
-                )
-                output.write("\n")
+            with tempfile.TemporaryDirectory(
+                dir=os.path.dirname(os.path.abspath(path))
+            ) as directory:
+                temporary_path = os.path.join(directory, "results.json")
+                with open(temporary_path, "w") as output:
+                    json.dump(
+                        dict(schema_version=1, config=config, plan=plan, ranks=ranks),
+                        output,
+                        indent=2,
+                        allow_nan=False,
+                    )
+                    output.write("\n")
+                os.replace(temporary_path, path)
             print(f"Results saved to {path}", flush=True)
         except (OSError, TypeError, ValueError) as exc:
             error = f"Failed to save results to {path}: {type(exc).__name__}: {exc}"
@@ -800,8 +809,9 @@ def capture(forward, barrier=dist.barrier, do_capture=True):
     # `do_capture=False` runs the same warm-ups and barriers without capturing
     torch.cuda.synchronize()
     barrier()
-    for _ in range(2):
-        forward()
+    with torch.cuda.stream(torch.cuda.Stream()):
+        for _ in range(2):
+            forward()
     torch.cuda.synchronize()
     barrier()
     graph, outputs = None, None
@@ -1019,6 +1029,7 @@ class GraphCase:
         del self.outputs, self.recv_x, self.graph, self.stats, self.stats_storage
         self.outputs = self.recv_x = self.graph = self.stats = self.stats_storage = None
         torch.cuda.synchronize()
+        self.handle = None
 
 
 def expected_mode(
