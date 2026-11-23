@@ -34,7 +34,17 @@ import os
 import time
 from datetime import timedelta
 from statistics import median_high as median
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, TypedDict, Union
+from typing import (
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    TypedDict,
+    Union,
+    cast,
+)
 
 import torch
 import torch.distributed as dist
@@ -1320,7 +1330,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                     case,
                     phase_idx,
                     phase,
-                    active_mode,
+                    cast(str, active_mode),
                     args,
                     measure_events=measure_events,
                     measure_kernels=measure_kernels,
