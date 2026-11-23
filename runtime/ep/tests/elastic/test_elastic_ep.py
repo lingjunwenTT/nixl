@@ -23,8 +23,9 @@ Launch: one invocation per node (`--num-processes` GPUs each) under node-level `
 no process group; the rank 0 process serves a TCPStore on `MASTER_ADDR` / `MASTER_PORT` (127.0.0.1:8361) for the whole
 run and keeps it alive until every peer has torn down (if a previous run still holds the port, choose another).
 `--store-timeout-secs` bounds every Store wait, `--num-cpu-timeout-secs` only the dispatch's CPU sync. `--num-experts`
-is the total physical slot count of the declared maximum world and must be divisible by its rank count. `--max-scaleup-ranks 72
---position-offset 64` assigns public IDs 64..71 to a 1 x 8 job; internal positions are discovered, not prescribed.
+is the total physical slot count of the declared maximum world and must be divisible by its rank count.
+`--num-processes 8 --max-scaleup-ranks 72 --position-offset 64 --num-experts 576` assigns public IDs 64..71
+to a 1 x 8 job; internal positions are discovered, not prescribed.
     python tests/elastic/test_elastic_ep.py --num-processes 4 --num-tokens 512 --hidden 7168 --num-topk 8 --num-experts 192
     python tests/elastic/test_elastic_ep.py --plan '[[0,1,2,3,4,5,6,7],[0,1,2,3],[0,1,2,3,4,5,6,7]]' ...
 """
