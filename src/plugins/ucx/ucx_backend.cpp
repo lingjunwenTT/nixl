@@ -201,8 +201,30 @@ nixl_status_t nixlUcxEngine::registerMem (const nixlBlobDesc &mem,
 {
     auto priv = std::make_unique<nixlUcxPrivateMetadata>();
 
+    void *host_addr = (void *)mem.addr;
+    nixl_mem_t ucx_mem_type = nixl_mem;
+
+#ifdef HAVE_TT_DEVICE_MEMORY
+    if (nixl_mem == VRAM_SEG) {
+        // Tenstorrent card memory: devId is N of /dev/tenstorrent/N and
+        // addr is (DRAM bank << 32) | address inside the bank.
+        const uint64_t bank = mem.addr >> 32;
+        const uint64_t bank_addr = mem.addr & 0xffffffffull;
+
+        if (bank_addr + mem.len > nixlUcxTtWindow::bankSize ||
+            !priv->ttWindow.open(mem.devId, bank)) {
+            NIXL_ERROR << "Failed to map DRAM bank " << bank << " of Tenstorrent card "
+                       << mem.devId;
+            return NIXL_ERR_BACKEND;
+        }
+        host_addr = priv->ttWindow.map + bank_addr;
+        priv->hostAddrDelta = (uintptr_t)host_addr - mem.addr;
+        ucx_mem_type = DRAM_SEG; // UCX sees the mapping as host memory
+    }
+#endif
+
     // TODO: Add nixl_mem check?
-    const int ret = uc->memReg((void*) mem.addr, mem.len, priv->mem, nixl_mem);
+    const int ret = uc->memReg(host_addr, mem.len, priv->mem, ucx_mem_type);
     if (ret) {
         return NIXL_ERR_BACKEND;
     }

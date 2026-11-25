@@ -32,6 +32,10 @@
 #include "rkey.h"
 #include "ucx_utils.h"
 
+#ifdef HAVE_TT_DEVICE_MEMORY
+#include "tt/tt_mem.h"
+#endif
+
 class nixlUcxConnection : public nixlBackendConnMD {
     private:
         std::vector<std::unique_ptr<nixlUcxEp>> eps;
@@ -53,6 +57,9 @@ class nixlUcxPrivateMetadata : public nixlBackendMD {
         // Host address of registered memory = address in its descriptor + hostAddrDelta.
         uint64_t hostAddrDelta = 0;
         nixl_blob_t rkeyStr; // hostAddrDelta followed by the packed rkey
+#ifdef HAVE_TT_DEVICE_MEMORY
+        nixlUcxTtWindow ttWindow; // used by VRAM_SEG; unmapped with this object
+#endif
 
     public:
         nixlUcxPrivateMetadata() : nixlBackendMD(true) {
