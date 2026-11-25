@@ -217,6 +217,12 @@ nixl_status_t nixlUcxEngine::registerMem (const nixlBlobDesc &mem,
                        << mem.devId;
             return NIXL_ERR_BACKEND;
         }
+        // An RDMA NIC registers the mapping through its dma-buf.
+        if (ucs_tt_dmabuf_set(
+                priv->ttWindow.map, nixlUcxTtWindow::windowSize, priv->ttWindow.dmabufFd) != 0) {
+            NIXL_ERROR << "Too many Tenstorrent card memory registrations";
+            return NIXL_ERR_BACKEND;
+        }
         host_addr = priv->ttWindow.map + bank_addr;
         priv->hostAddrDelta = (uintptr_t)host_addr - mem.addr;
         ucx_mem_type = DRAM_SEG; // UCX sees the mapping as host memory

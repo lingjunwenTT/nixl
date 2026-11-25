@@ -33,6 +33,7 @@
 #include "ucx_utils.h"
 
 #ifdef HAVE_TT_DEVICE_MEMORY
+#include <ucs/memory/memtype_cache.h> // ucs_tt_dmabuf_*, from contrib/tt/ucx-patches
 #include "tt/tt_mem.h"
 #endif
 
@@ -64,6 +65,14 @@ class nixlUcxPrivateMetadata : public nixlBackendMD {
     public:
         nixlUcxPrivateMetadata() : nixlBackendMD(true) {
         }
+
+#ifdef HAVE_TT_DEVICE_MEMORY
+        ~nixlUcxPrivateMetadata() {
+            if (ttWindow.dmabufFd >= 0) {
+                ucs_tt_dmabuf_unset(ttWindow.map);
+            }
+        }
+#endif
 
         [[nodiscard]] const std::string& get() const noexcept {
             return rkeyStr;

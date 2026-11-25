@@ -48,6 +48,9 @@ struct nixlUcxTtWindow {
 
     int fd = -1;
     char *map = nullptr; // host address of the bank's address 0
+    // A dma-buf of the whole window (offset 0 is map). An RDMA NIC cannot register
+    // the mapping by address, only through this.
+    int dmabufFd = -1;
 
     nixlUcxTtWindow() = default;
     nixlUcxTtWindow(const nixlUcxTtWindow &) = delete;
@@ -55,6 +58,9 @@ struct nixlUcxTtWindow {
     operator=(const nixlUcxTtWindow &) = delete;
 
     ~nixlUcxTtWindow() {
+        if (dmabufFd >= 0) {
+            close(dmabufFd);
+        }
         if (map) {
             munmap(map, windowSize);
         }
@@ -103,6 +109,14 @@ struct nixlUcxTtWindow {
             return false;
         }
         map = static_cast<char *>(addr);
+
+        tenstorrent_export_tlb_dmabuf dmabuf = {};
+        dmabuf.argsz = sizeof(dmabuf);
+        dmabuf.tlb_id = alloc.out.id;
+        if (ioctl(fd, TENSTORRENT_IOCTL_EXPORT_TLB_DMABUF, &dmabuf) != 0) {
+            return false;
+        }
+        dmabufFd = dmabuf.fd;
         return true;
     }
 };

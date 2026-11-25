@@ -516,6 +516,11 @@ endif
 
 # Tenstorrent card memory in the UCX plugin (see src/plugins/ucx/tt)
 if get_option('tt_device_memory')
+    if not cpp.has_function('ucs_tt_dmabuf_set',
+                            prefix: '#include <ucs/memory/memtype_cache.h>',
+                            dependencies: ucx_dep)
+        error('tt_device_memory needs a UCX built with contrib/tt/ucx-patches')
+    endif
     add_project_arguments('-DHAVE_TT_DEVICE_MEMORY', language: 'cpp')
 endif
 
