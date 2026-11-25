@@ -38,6 +38,7 @@
 #include "rkey.h"
 #include "ucx_enums.h"
 #include "ucx_utils.h"
+#include "tt_mem.h"
 
 class nixlUcxConnection : public nixlBackendConnMD {
     private:
@@ -57,11 +58,16 @@ using ucx_connection_ptr_t = std::shared_ptr<nixlUcxConnection>;
 class nixlUcxPrivateMetadata : public nixlBackendMD {
     private:
         nixlUcxMem mem;
-        nixl_blob_t rkeyStr;
+        nixl_blob_t rkeyStr; // hostAddrDelta followed by the packed rkey
+        // Host address of a descriptor = descriptor addr + hostAddrDelta.
+        uint64_t hostAddrDelta = 0;
+        nixlUcxTtWindow ttWindow; // TT_SEG only; unmapped when this metadata is deleted
 
     public:
         nixlUcxPrivateMetadata() : nixlBackendMD(true) {
         }
+
+        ~nixlUcxPrivateMetadata();
 
         [[nodiscard]] const std::string& get() const noexcept {
             return rkeyStr;
@@ -79,7 +85,9 @@ class nixlUcxPrivateMetadata : public nixlBackendMD {
 class nixlUcxPublicMetadata : public nixlBackendMD {
 public:
     nixlUcxPublicMetadata() = delete;
-    nixlUcxPublicMetadata(const ucx_connection_ptr_t &conn, std::vector<nixl::ucx::rkey> &&rkeys);
+    nixlUcxPublicMetadata(const ucx_connection_ptr_t &conn,
+                          std::vector<nixl::ucx::rkey> &&rkeys,
+                          uint64_t host_addr_delta);
 
     [[nodiscard]] const nixl::ucx::rkey &
     getRkey(const size_t id) const {
@@ -87,6 +95,7 @@ public:
     }
 
     const ucx_connection_ptr_t conn;
+    const uint64_t hostAddrDelta; // of the agent that registered the memory
 
 private:
     const std::vector<nixl::ucx::rkey> rkeys_;
