@@ -514,6 +514,11 @@ if ucx_dep.found()
     endif
 endif
 
+# Tenstorrent card memory in the UCX plugin (see src/plugins/ucx/tt)
+if get_option('tt_device_memory')
+    add_project_arguments('-DHAVE_TT_DEVICE_MEMORY', language: 'cpp')
+endif
+
 if get_option('disable_gds_backend')
     add_project_arguments('-DDISABLE_GDS_BACKEND', language: 'cpp')
 endif
