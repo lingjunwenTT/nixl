@@ -26,3 +26,7 @@ subprojects/*
 
 # ucx-spcx-plugin source fetched into the build context by build-container.sh
 ucx-spcx-plugin-src/
+
+# contrib/tt/build-tt-wheel.sh
+/build-tt/
+/dist/
