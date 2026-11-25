@@ -67,6 +67,8 @@ class nixlUcxPrivateMetadata : public nixlBackendMD {
         nixlUcxPrivateMetadata() : nixlBackendMD(true) {
         }
 
+        ~nixlUcxPrivateMetadata();
+
         [[nodiscard]] const std::string& get() const noexcept {
             return rkeyStr;
         }

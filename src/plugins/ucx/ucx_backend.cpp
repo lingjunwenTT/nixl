@@ -923,6 +923,15 @@ nixl_status_t nixlUcxEngine::loadRemoteConnInfo (const std::string &remote_agent
 /****************************************
  * Memory management
 *****************************************/
+// Added to UCX by ucx-tt-dmabuf.patch (in tt-nixl-throwaway): tells UCX that [va, va + length)
+// is backed by dma-buf fd, so that IB registers it with ibv_reg_dmabuf_mr. fd < 0 removes it.
+extern "C" int
+ucs_tt_dmabuf_set(void *va, size_t length, int fd);
+
+nixlUcxPrivateMetadata::~nixlUcxPrivateMetadata() {
+    if (ttWindow.dmabufFd >= 0) ucs_tt_dmabuf_set(ttWindow.map, 0, -1);
+}
+
 nixl_status_t nixlUcxEngine::registerMem (const nixlBlobDesc &mem,
                                           const nixl_mem_t &nixl_mem,
                                           nixlBackendMD* &out)
@@ -938,6 +947,9 @@ nixl_status_t nixlUcxEngine::registerMem (const nixlBlobDesc &mem,
             return NIXL_ERR_BACKEND;
         }
         priv->hostAddrDelta = (uintptr_t)priv->ttWindow.map - (bank << 32);
+        if (priv->ttWindow.dmabufFd >= 0) {
+            ucs_tt_dmabuf_set(priv->ttWindow.map, nixlUcxTtWindow::size, priv->ttWindow.dmabufFd);
+        }
     }
 
     // TODO: Add nixl_mem check?
