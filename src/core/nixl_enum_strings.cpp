@@ -28,6 +28,8 @@ memTypeStr(const nixl_mem_t &mem) {
         return "DRAM_SEG";
     case VRAM_SEG:
         return "VRAM_SEG";
+    case TT_SEG:
+        return "TT_SEG";
     case BLK_SEG:
         return "BLK_SEG";
     case OBJ_SEG:

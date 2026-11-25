@@ -38,6 +38,7 @@
 #include "rkey.h"
 #include "ucx_enums.h"
 #include "ucx_utils.h"
+#include "tt_mem.h"
 
 class nixlUcxConnection : public nixlBackendConnMD {
     private:
@@ -58,6 +59,9 @@ class nixlUcxPrivateMetadata : public nixlBackendMD {
     private:
         nixlUcxMem mem;
         nixl_blob_t rkeyStr;
+        nixlUcxTtWindow ttWindow;
+        // Host address of a descriptor = descriptor addr + hostAddrDelta (0 unless TT_SEG).
+        uint64_t hostAddrDelta = 0;
 
     public:
         nixlUcxPrivateMetadata() : nixlBackendMD(true) {
@@ -79,7 +83,9 @@ class nixlUcxPrivateMetadata : public nixlBackendMD {
 class nixlUcxPublicMetadata : public nixlBackendMD {
 public:
     nixlUcxPublicMetadata() = delete;
-    nixlUcxPublicMetadata(const ucx_connection_ptr_t &conn, std::vector<nixl::ucx::rkey> &&rkeys);
+    nixlUcxPublicMetadata(const ucx_connection_ptr_t &conn,
+                          std::vector<nixl::ucx::rkey> &&rkeys,
+                          uint64_t host_addr_delta);
 
     [[nodiscard]] const nixl::ucx::rkey &
     getRkey(const size_t id) const {
@@ -87,6 +93,7 @@ public:
     }
 
     const ucx_connection_ptr_t conn;
+    const uint64_t hostAddrDelta;
 
 private:
     const std::vector<nixl::ucx::rkey> rkeys_;

@@ -846,6 +846,7 @@ nixl_mem_list_t nixlUcxEngine::getSupportedMems () const {
     nixl_mem_list_t mems;
     mems.push_back(DRAM_SEG);
     mems.push_back(VRAM_SEG);
+    mems.push_back(TT_SEG);
     return mems;
 }
 
@@ -928,16 +929,30 @@ nixl_status_t nixlUcxEngine::registerMem (const nixlBlobDesc &mem,
 {
     auto priv = std::make_unique<nixlUcxPrivateMetadata>();
 
-    // TODO: Add nixl_mem check?
-    const int ret = uc->memReg((void*) mem.addr, mem.len, priv->mem, nixl_mem);
-    if (ret) {
-        return NIXL_ERR_BACKEND;
+    void *host_addr = (void *)mem.addr;
+    if (nixl_mem == TT_SEG) {
+        if (nixlUcxTtMap(mem.devId, mem.addr, mem.len, priv->ttWindow) != 0) {
+            NIXL_ERROR << "Failed to map TT memory on device " << mem.devId;
+            return NIXL_ERR_BACKEND;
+        }
+        host_addr = priv->ttWindow.va;
     }
-    priv->rkeyStr = uc->packRkey(priv->mem);
+    priv->hostAddrDelta = (uintptr_t)host_addr - mem.addr;
 
-    if (priv->rkeyStr.empty()) {
+    const int ret = uc->memReg(host_addr, mem.len, priv->mem, nixl_mem);
+    if (ret) {
+        nixlUcxTtUnmap(priv->ttWindow);
         return NIXL_ERR_BACKEND;
     }
+    const std::string rkey = uc->packRkey(priv->mem);
+
+    if (rkey.empty()) {
+        nixlUcxTtUnmap(priv->ttWindow);
+        return NIXL_ERR_BACKEND;
+    }
+    // Public data is the host address delta followed by the packed rkey.
+    priv->rkeyStr.assign((const char *)&priv->hostAddrDelta, sizeof(priv->hostAddrDelta));
+    priv->rkeyStr += rkey;
     out = priv.release();
     return NIXL_SUCCESS;
 }
@@ -946,6 +961,7 @@ nixl_status_t nixlUcxEngine::deregisterMem (nixlBackendMD* meta)
 {
     nixlUcxPrivateMetadata *priv = (nixlUcxPrivateMetadata*) meta;
     uc->memDereg(priv->mem);
+    nixlUcxTtUnmap(priv->ttWindow);
     delete priv;
     return NIXL_SUCCESS;
 }
@@ -973,9 +989,11 @@ makePublicMetadataRkeys(const ucx_connection_ptr_t &conn, const size_t count, co
 } // namespace
 
 nixlUcxPublicMetadata::nixlUcxPublicMetadata(const ucx_connection_ptr_t &conn,
-                                             std::vector<nixl::ucx::rkey> &&rkeys)
+                                             std::vector<nixl::ucx::rkey> &&rkeys,
+                                             uint64_t host_addr_delta)
     : nixlBackendMD(false),
       conn(conn),
+      hostAddrDelta(host_addr_delta),
       rkeys_(std::move(rkeys)) {}
 
 nixl_status_t
@@ -990,8 +1008,16 @@ nixlUcxEngine::internalMDHelper (const nixl_blob_t &blob,
             return NIXL_ERR_NOT_FOUND;
         }
         // nixlSerDes::_stringToBytes() was used to "unpack" blob here.
+        uint64_t host_addr_delta;
+        if (blob.size() <= sizeof(host_addr_delta)) {
+            return NIXL_ERR_INVALID_PARAM;
+        }
+        memcpy(&host_addr_delta, blob.data(), sizeof(host_addr_delta));
         output = new nixlUcxPublicMetadata(
-            it->second, makePublicMetadataRkeys(it->second, uws.size(), blob.data()));
+            it->second,
+            makePublicMetadataRkeys(
+                it->second, uws.size(), blob.data() + sizeof(host_addr_delta)),
+            host_addr_delta);
         return NIXL_SUCCESS;
     }
     catch (const std::runtime_error &e) {
@@ -1160,13 +1186,13 @@ nixlUcxEngine::sendXferRangeBatch(nixlUcxEp &ep,
     batchResult result = {NIXL_SUCCESS, 0, nullptr};
 
     for (size_t i = start_idx; i < end_idx; ++i) {
-        void *laddr = (void *)local[i].addr;
         size_t lsize = local[i].len;
-        uint64_t raddr = static_cast<uint64_t>(remote[i].addr);
         NIXL_ASSERT(lsize == remote[i].len);
 
         const auto lmd = static_cast<nixlUcxPrivateMetadata *>(local[i].metadataP);
         const auto rmd = static_cast<nixlUcxPublicMetadata *>(remote[i].metadataP);
+        void *laddr = (void *)(local[i].addr + lmd->hostAddrDelta);
+        uint64_t raddr = static_cast<uint64_t>(remote[i].addr) + rmd->hostAddrDelta;
         auto &rmd_ep = rmd->conn->getEp(worker_id);
         if (rmd_ep.get() != &ep) [[unlikely]] {
             break;

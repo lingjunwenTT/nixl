@@ -28,7 +28,7 @@ createStaticUCXPlugin() {
                                 "UCX",
                                 "0.1.0",
                                 get_ucx_backend_common_options(),
-                                {DRAM_SEG, VRAM_SEG});
+                                {DRAM_SEG, VRAM_SEG, TT_SEG});
 }
 #else
 extern "C" NIXL_PLUGIN_EXPORT nixlBackendPlugin *
@@ -37,7 +37,7 @@ nixl_plugin_init() {
                                 "UCX",
                                 "0.1.0",
                                 get_ucx_backend_common_options(),
-                                {DRAM_SEG, VRAM_SEG});
+                                {DRAM_SEG, VRAM_SEG, TT_SEG});
 }
 
 extern "C" NIXL_PLUGIN_EXPORT void
