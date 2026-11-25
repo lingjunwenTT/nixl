@@ -30,6 +30,7 @@ class nixlDlistH;
 class nixlBackendH;
 class nixlXferReqH;
 class nixlAgentData;
+class nixlCompletionMonitor;
 
 
 /*** NIXL memory type, operation and status enums ***/
@@ -161,6 +162,33 @@ enum class nixl_cost_t {
  */
 using nixl_query_resp_t = std::optional<nixl_b_params_t>;
 
+/**
+ * @struct nixlXferCompletion
+ * @brief A completed transfer request and its status
+ */
+struct nixlXferCompletion {
+    nixlXferReqH *req;
+    nixl_status_t status;
+};
+
+/**
+ * @class nixlXferCallback
+ * @brief Receiver of transfer completions. completed() is called when a posted transfer
+ *        request may have completed. The call can come from a backend thread: it must
+ *        not block and must not call the agent or the backend.
+ */
+class nixlXferCallback {
+public:
+    virtual ~nixlXferCallback() = default;
+
+    /**
+     * @param  completion    The request, and NIXL_SUCCESS or the error code that the backend
+     *                       saw. The status returned by getXferStatus remains the reference.
+     */
+    virtual void
+    completed(const nixlXferCompletion &completion) = 0;
+};
+
 
 /**
  * @struct nixlAgentOptionalArgs
@@ -239,6 +267,12 @@ struct nixlAgentOptionalArgs {
      *      stages, and any state retained in its prepared request.
      */
     nixl_blob_t customParam;
+
+    /**
+     * @var monitor Completion monitor to attach the transfer posted by postXferReq to.
+     *              It must outlive the transfer request until that request is released.
+     */
+    nixlCompletionMonitor *monitor = nullptr;
 };
 /**
  * @brief A typedef for a nixlAgentOptionalArgs

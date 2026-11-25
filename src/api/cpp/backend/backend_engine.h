@@ -34,6 +34,7 @@ enum class nixl_backend_capability_t : uint64_t {
     LOCAL = 1ULL << 1,
     NOTIF = 1ULL << 2,
     TRACE_CONTEXT = 1ULL << 3,
+    COMPLETION = 1ULL << 4,
 };
 
 [[nodiscard]] constexpr nixl_backend_capability_t
