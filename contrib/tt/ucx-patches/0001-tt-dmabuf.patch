@@ -1,0 +1,141 @@
+diff --git a/src/ucs/memory/memtype_cache.c b/src/ucs/memory/memtype_cache.c
+index 3378254..b4b537a 100644
+--- a/src/ucs/memory/memtype_cache.c
++++ b/src/ucs/memory/memtype_cache.c
+@@ -20,6 +20,7 @@
+ #include <ucs/sys/sys.h>
+ #include <ucs/sys/ptr_arith.h>
+ #include <ucm/api/ucm.h>
++#include <pthread.h>
+ 
+ 
+ static ucs_spinlock_t ucs_memtype_cache_global_instance_lock;
+@@ -454,3 +455,71 @@ void ucs_memtype_cache_cleanup()
+         ucs_memtype_cache_global_instance = NULL;
+     }
+ }
++
++
++/*
++ * Tenstorrent card memory: host address ranges that are backed by a dma-buf.
++ * IB registers such a range with ibv_reg_dmabuf_mr instead of ibv_reg_mr.
++ */
++#define UCS_TT_DMABUF_MAX_RANGES 64
++
++typedef struct {
++    void   *va;
++    size_t length; /* 0 if the slot is free */
++    int    fd;
++} ucs_tt_dmabuf_range_t;
++
++static ucs_tt_dmabuf_range_t ucs_tt_dmabuf_ranges[UCS_TT_DMABUF_MAX_RANGES];
++static pthread_mutex_t ucs_tt_dmabuf_lock = PTHREAD_MUTEX_INITIALIZER;
++
++int ucs_tt_dmabuf_set(void *va, size_t length, int fd)
++{
++    ucs_tt_dmabuf_range_t *range;
++    int ret = -1;
++
++    pthread_mutex_lock(&ucs_tt_dmabuf_lock);
++    ucs_carray_for_each(range, ucs_tt_dmabuf_ranges, UCS_TT_DMABUF_MAX_RANGES) {
++        if (range->length == 0) {
++            range->va     = va;
++            range->length = length;
++            range->fd     = fd;
++            ret           = 0;
++            break;
++        }
++    }
++    pthread_mutex_unlock(&ucs_tt_dmabuf_lock);
++    return ret;
++}
++
++void ucs_tt_dmabuf_unset(void *va)
++{
++    ucs_tt_dmabuf_range_t *range;
++
++    pthread_mutex_lock(&ucs_tt_dmabuf_lock);
++    ucs_carray_for_each(range, ucs_tt_dmabuf_ranges, UCS_TT_DMABUF_MAX_RANGES) {
++        if ((range->length != 0) && (range->va == va)) {
++            range->length = 0;
++            break;
++        }
++    }
++    pthread_mutex_unlock(&ucs_tt_dmabuf_lock);
++}
++
++int ucs_tt_dmabuf_get(void *address, size_t length, size_t *offset_p)
++{
++    ucs_tt_dmabuf_range_t *range;
++    int fd = -1;
++
++    pthread_mutex_lock(&ucs_tt_dmabuf_lock);
++    ucs_carray_for_each(range, ucs_tt_dmabuf_ranges, UCS_TT_DMABUF_MAX_RANGES) {
++        if ((range->length != 0) && (address >= range->va) &&
++            (UCS_PTR_BYTE_OFFSET(address, length) <=
++             UCS_PTR_BYTE_OFFSET(range->va, range->length))) {
++            fd        = range->fd;
++            *offset_p = UCS_PTR_BYTE_DIFF(range->va, address);
++            break;
++        }
++    }
++    pthread_mutex_unlock(&ucs_tt_dmabuf_lock);
++    return fd;
++}
+diff --git a/src/ucs/memory/memtype_cache.h b/src/ucs/memory/memtype_cache.h
+index 7f38ed0..62fa2b6 100644
+--- a/src/ucs/memory/memtype_cache.h
++++ b/src/ucs/memory/memtype_cache.h
+@@ -131,6 +131,28 @@ ucs_memory_info_set_host(ucs_memory_info_t *mem_info)
+     mem_info->mem_flags    = UCS_MEM_FLAG_REGISTRABLE;
+ }
+ 
++/**
++ * Tenstorrent card memory: tell UCX that [va, va + length) is backed by the
++ * dma-buf @a fd, with @a va at offset 0 of the dma-buf. The caller keeps
++ * @a fd open until @ref ucs_tt_dmabuf_unset.
++ *
++ * @return 0 on success, -1 if the table is full.
++ */
++int ucs_tt_dmabuf_set(void *va, size_t length, int fd);
++
++
++/**
++ * Remove the range that was set at @a va.
++ */
++void ucs_tt_dmabuf_unset(void *va);
++
++
++/**
++ * @return The dma-buf fd that backs [address, address + length) and, in
++ *         @a offset_p, the offset of @a address inside it; -1 if none.
++ */
++int ucs_tt_dmabuf_get(void *address, size_t length, size_t *offset_p);
++
+ END_C_DECLS
+ 
+ #endif
+diff --git a/src/uct/ib/base/ib_md.c b/src/uct/ib/base/ib_md.c
+index be919df..dfd54d7 100644
+--- a/src/uct/ib/base/ib_md.c
++++ b/src/uct/ib/base/ib_md.c
+@@ -16,6 +16,7 @@
+ #include "ib_log.inl"
+ 
+ #include <ucs/arch/atomic.h>
++#include <ucs/memory/memtype_cache.h>
+ #include <ucs/profile/profile.h>
+ #include <ucs/sys/module.h>
+ #include <ucs/sys/ptr_arith.h>
+@@ -525,6 +526,11 @@ ucs_status_t uct_ib_reg_mr(const uct_ib_md_t *md, void *address, size_t length,
+                                     DMABUF_OFFSET, 0);
+     access_flags  = uct_ib_md_access_flags(md, access_flags);
+ 
++    if ((dm == NULL) && (dmabuf_fd == UCT_DMABUF_FD_INVALID)) {
++        /* Tenstorrent card memory mapped into this process */
++        dmabuf_fd = ucs_tt_dmabuf_get(address, length, &dmabuf_offset);
++    }
++
+     if (dm != NULL) {
+ #if HAVE_IBV_DM
+         title = "ibv_reg_dm_mr";
