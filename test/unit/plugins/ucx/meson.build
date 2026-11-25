@@ -76,3 +76,12 @@ if get_option('buildtype') != 'release'
     endif
 
 endif
+
+# Needs Tenstorrent cards; exits as skipped (77) without them.
+if get_option('tt_device_memory')
+    ucx_tt_vram_test = executable('ucx_tt_vram_test',
+            'ucx_tt_vram_test.cpp',
+            dependencies: ucx_backend_test_dep,
+            include_directories: ucx_test_include_directories,
+            install: true)
+endif
