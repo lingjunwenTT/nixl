@@ -38,6 +38,7 @@
 #include "rkey.h"
 #include "ucx_enums.h"
 #include "ucx_utils.h"
+#include "tt_mem.h"
 
 class nixlUcxConnection : public nixlBackendConnMD {
     private:
@@ -60,6 +61,7 @@ class nixlUcxPrivateMetadata : public nixlBackendMD {
         nixl_blob_t rkeyStr; // hostAddrDelta followed by the packed rkey
         // Host address of a descriptor = descriptor addr + hostAddrDelta.
         uint64_t hostAddrDelta = 0;
+        nixlUcxTtWindow ttWindow; // TT_SEG only; unmapped when this metadata is deleted
 
     public:
         nixlUcxPrivateMetadata() : nixlBackendMD(true) {

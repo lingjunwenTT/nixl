@@ -846,6 +846,7 @@ nixl_mem_list_t nixlUcxEngine::getSupportedMems () const {
     nixl_mem_list_t mems;
     mems.push_back(DRAM_SEG);
     mems.push_back(VRAM_SEG);
+    mems.push_back(TT_SEG);
     return mems;
 }
 
@@ -927,6 +928,17 @@ nixl_status_t nixlUcxEngine::registerMem (const nixlBlobDesc &mem,
                                           nixlBackendMD* &out)
 {
     auto priv = std::make_unique<nixlUcxPrivateMetadata>();
+
+    if (nixl_mem == TT_SEG) {
+        // addr = (DRAM bank << 32) | address inside the bank; the window maps the whole bank.
+        const uint64_t bank = mem.addr >> 32;
+        if ((uint32_t)mem.addr + mem.len > nixlUcxTtWindow::bankSize ||
+            !priv->ttWindow.open(mem.devId, bank)) {
+            NIXL_ERROR << "Failed to map TT memory on device " << mem.devId;
+            return NIXL_ERR_BACKEND;
+        }
+        priv->hostAddrDelta = (uintptr_t)priv->ttWindow.map - (bank << 32);
+    }
 
     // TODO: Add nixl_mem check?
     void *host_addr = (void *)(mem.addr + priv->hostAddrDelta);
