@@ -50,7 +50,9 @@ using ucx_connection_ptr_t = std::shared_ptr<nixlUcxConnection>;
 class nixlUcxPrivateMetadata : public nixlBackendMD {
     private:
         nixlUcxMem mem;
-        nixl_blob_t rkeyStr;
+        // Host address of registered memory = address in its descriptor + hostAddrDelta.
+        uint64_t hostAddrDelta = 0;
+        nixl_blob_t rkeyStr; // hostAddrDelta followed by the packed rkey
 
     public:
         nixlUcxPrivateMetadata() : nixlBackendMD(true) {
@@ -65,6 +67,11 @@ class nixlUcxPrivateMetadata : public nixlBackendMD {
             return mem;
         }
 
+        [[nodiscard]] uint64_t
+        getHostAddrDelta() const noexcept {
+            return hostAddrDelta;
+        }
+
     friend class nixlUcxEngine;
 };
 
@@ -72,7 +79,9 @@ class nixlUcxPrivateMetadata : public nixlBackendMD {
 class nixlUcxPublicMetadata : public nixlBackendMD {
 public:
     nixlUcxPublicMetadata() = delete;
-    nixlUcxPublicMetadata(const ucx_connection_ptr_t &conn, std::vector<nixl::ucx::rkey> &&rkeys);
+    nixlUcxPublicMetadata(const ucx_connection_ptr_t &conn,
+                          uint64_t host_addr_delta,
+                          std::vector<nixl::ucx::rkey> &&rkeys);
 
     [[nodiscard]] const nixl::ucx::rkey &
     getRkey(const size_t id) const {
@@ -80,6 +89,7 @@ public:
     }
 
     const ucx_connection_ptr_t conn;
+    const uint64_t hostAddrDelta; // of the agent that registered the memory
 
 private:
     const std::vector<nixl::ucx::rkey> rkeys_;

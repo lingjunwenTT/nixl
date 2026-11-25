@@ -101,7 +101,7 @@ memListElement::create(const nixlRemoteMetaDesc &desc, size_t worker_id) {
     element.field_mask = UCP_DEVICE_MEM_LIST_ELEM_FIELD_RKEY |
         UCP_DEVICE_MEM_LIST_ELEM_FIELD_REMOTE_ADDR | UCP_DEVICE_MEM_LIST_ELEM_FIELD_EP;
     element.rkey = md->getRkey(worker_id).get();
-    element.remote_addr = static_cast<uint64_t>(desc.addr);
+    element.remote_addr = static_cast<uint64_t>(desc.addr) + md->hostAddrDelta;
     element.ep = md->conn->getEp(worker_id)->getEp();
     return element;
 }

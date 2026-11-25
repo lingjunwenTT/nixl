@@ -54,8 +54,8 @@ sglXfer::sglXfer(const nixl_meta_dlist_t &local,
         NIXL_ASSERT(local[i].len == remote[i].len);
         NIXL_ASSERT(rmd->conn == conn_);
 
-        localAddrs_[out] = reinterpret_cast<void *>(local[i].addr);
-        remoteAddrs_[out] = static_cast<uint64_t>(remote[i].addr);
+        localAddrs_[out] = reinterpret_cast<void *>(local[i].addr + lmd->getHostAddrDelta());
+        remoteAddrs_[out] = static_cast<uint64_t>(remote[i].addr) + rmd->hostAddrDelta;
         lengths_[out] = local[i].len;
         memhs_[out] = lmd->getMem().getMemh();
         rkeys_[out] = rmd->getRkey(worker_id).get();

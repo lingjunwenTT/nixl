@@ -206,11 +206,13 @@ nixl_status_t nixlUcxEngine::registerMem (const nixlBlobDesc &mem,
     if (ret) {
         return NIXL_ERR_BACKEND;
     }
-    priv->rkeyStr = uc->packRkey(priv->mem);
+    const std::string rkey = uc->packRkey(priv->mem);
 
-    if (priv->rkeyStr.empty()) {
+    if (rkey.empty()) {
         return NIXL_ERR_BACKEND;
     }
+    priv->rkeyStr.assign((const char *)&priv->hostAddrDelta, sizeof(priv->hostAddrDelta));
+    priv->rkeyStr += rkey;
     out = priv.release();
     return NIXL_SUCCESS;
 }
@@ -246,9 +248,11 @@ makePublicMetadataRkeys(const ucx_connection_ptr_t &conn, const size_t count, co
 } // namespace
 
 nixlUcxPublicMetadata::nixlUcxPublicMetadata(const ucx_connection_ptr_t &conn,
+                                             uint64_t host_addr_delta,
                                              std::vector<nixl::ucx::rkey> &&rkeys)
     : nixlBackendMD(false),
       conn(conn),
+      hostAddrDelta(host_addr_delta),
       rkeys_(std::move(rkeys)) {}
 
 nixl_status_t
@@ -269,8 +273,14 @@ nixlUcxEngine::internalMDHelper (const nixl_blob_t &blob,
             }
         }
         // nixlSerDes::_stringToBytes() was used to "unpack" blob here.
-        output = new nixlUcxPublicMetadata(
-            it->second, makePublicMetadataRkeys(it->second, workers_.size(), blob.data()));
+        uint64_t host_addr_delta;
+        if (blob.size() <= sizeof(host_addr_delta)) {
+            return NIXL_ERR_INVALID_PARAM;
+        }
+        memcpy(&host_addr_delta, blob.data(), sizeof(host_addr_delta));
+        const char *rkey = blob.data() + sizeof(host_addr_delta);
+        auto rkeys = makePublicMetadataRkeys(it->second, workers_.size(), rkey);
+        output = new nixlUcxPublicMetadata(it->second, host_addr_delta, std::move(rkeys));
         return NIXL_SUCCESS;
     }
     catch (const std::runtime_error &e) {
@@ -508,13 +518,13 @@ nixlUcxEngine::sendXferRange(const nixl_xfer_op_t &operation,
     nixlUcxReq pending_req = nullptr;
 
     for (size_t i = start_idx; i < end_idx; ++i) {
-        void *laddr = (void *)local[i].addr;
         size_t lsize = local[i].len;
-        uint64_t raddr = static_cast<uint64_t>(remote[i].addr);
         NIXL_ASSERT(lsize == remote[i].len);
 
         const auto lmd = static_cast<nixlUcxPrivateMetadata *>(local[i].metadataP);
         const auto rmd = static_cast<nixlUcxPublicMetadata *>(remote[i].metadataP);
+        void *laddr = (void *)(local[i].addr + lmd->hostAddrDelta);
+        uint64_t raddr = static_cast<uint64_t>(remote[i].addr) + rmd->hostAddrDelta;
         NIXL_ASSERT(rmd->conn->getEp(worker_id).get() == ep.get());
 
         nixlUcxReq req;
